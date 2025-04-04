@@ -9,6 +9,7 @@ use axum::{
     response::Response,
     routing::get,
 };
+use base64::prelude::*;
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
@@ -66,10 +67,16 @@ async fn auth_middleware(
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    let utc_date: DateTime<Utc> = date_header.parse().map_err(|_| StatusCode::FORBIDDEN)?;
+    let utc_date: DateTime<Utc> = DateTime::parse_from_rfc2822(date_header)
+        .map_err(|parse_error| {
+            tracing::error!("Error parsing date header value: {}", parse_error);
+            StatusCode::FORBIDDEN
+        })?
+        .to_utc();
 
     // Ensure the date header is no older than 15 minutes to prevent replay attacks.
     if Utc::now().signed_duration_since(utc_date) > Duration::minutes(15) {
+        tracing::debug!("Date header is older than 15 mins");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -80,19 +87,20 @@ async fn auth_middleware(
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    // Parse the auth header to extract the authentication scheme, account name, and signature
+    // Parse the auth header to extract the authentication scheme, account name, and signature.
     // Format: "[SharedKey|SharedKeyLite] <AccountName>:<Signature>"
     let (auth_scheme, account_and_signature) = match auth_header.split_once(' ') {
         Some(parts) => parts,
         None => return Err(StatusCode::FORBIDDEN),
     };
 
-    // Ensure the auth scheme is either "SharedKey" or "SharedKeyLite"
+    // Ensure the auth scheme is either "SharedKey" or "SharedKeyLite".
     if auth_scheme != "SharedKey" && auth_scheme != "SharedKeyLite" {
+        tracing::debug!("Invalid auth scheme: {}", auth_scheme);
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Extract the account name and signature
+    // Extract the account name and signature.
     let (account_name, signature) = match account_and_signature.split_once(':') {
         Some(parts) => parts,
         None => return Err(StatusCode::FORBIDDEN),
@@ -100,6 +108,7 @@ async fn auth_middleware(
 
     // TODO: check if account exists - 404?
     if account_name.is_empty() {
+        tracing::debug!("Account name is empty");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -127,9 +136,7 @@ async fn auth_middleware(
         canonicalized_resource
     );
 
-    tracing::debug!("Generated signature: {}", generated_signature);
-
-    if !verify_signature(&generated_signature, signature, account_name) {
+    if !verify_signature(&generated_signature, signature) {
         tracing::debug!("Signature verification failed");
         return Err(StatusCode::FORBIDDEN);
     } else {
@@ -163,13 +170,13 @@ fn canonicalize_ms_headers(headers: &HeaderMap) -> String {
 
 /// Canonicalizes the resource string.
 fn canonicalize_resource(uri: &str, account_name: &str) -> String {
-    // Parse the URI to extract path and query
+    // Parse the URI to extract path and query.
     let uri_parts: Vec<&str> = uri.split('?').collect();
     let path = uri_parts[0];
 
     let mut result = format!("/{}/{}", account_name, path.trim_start_matches('/'));
 
-    // If there are query parameters, canonicalize them
+    // If there are query parameters, canonicalize them.
     if uri_parts.len() > 1 {
         let query = uri_parts[1];
         let mut params = BTreeMap::new();
@@ -195,21 +202,17 @@ fn canonicalize_resource(uri: &str, account_name: &str) -> String {
 }
 
 // Function to validate the signature
-fn verify_signature(string_to_sign: &str, provided_signature: &str, account_name: &str) -> bool {
+fn verify_signature(string_to_sign: &str, provided_signature: &str) -> bool {
     // For the emulator, we use the default key
-    let decoded_key = base64::decode(EMULATOR_DEFAULT_ACCOUNT_KEY).unwrap_or_default();
+    let decoded_key = BASE64_STANDARD
+        .decode(EMULATOR_DEFAULT_ACCOUNT_KEY)
+        .expect("account key should be base64 decodable");
 
-    // Create HMAC-SHA256 instance
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(&decoded_key).expect("HMAC can take key of any size");
-
-    // Update with string to sign
-    mac.update(string_to_sign.as_bytes());
+    let mut hmac = Hmac::<Sha256>::new_from_slice(&decoded_key).unwrap();
+    hmac.update(string_to_sign.as_bytes());
 
     // Get the result and compare
-    let computed_signature = base64::encode(mac.finalize().into_bytes());
-
-    // Compare signatures (timing-attack safe comparison would be better)
+    let computed_signature = BASE64_STANDARD.encode(hmac.finalize().into_bytes());
     provided_signature == computed_signature
 }
 
