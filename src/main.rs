@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, Request},
     http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    middleware::Next,
     response::Response,
     routing::get,
 };
@@ -18,7 +18,9 @@ use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
+
+mod authorization;
+mod middleware;
 
 const EMULATOR_STORAGE_ACCOUNT_KIND: &str = "StorageV2";
 const EMULATOR_STORAGE_SKU: &str = "Standard_RAGRS";
@@ -26,28 +28,6 @@ const EMULATOR_STORAGE_VERSION: &str = "2025-05-05";
 const EMULATOR_HNS_ENABLED: bool = false;
 const EMULATOR_DEFAULT_ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
-
-/// Middleware that adds default response headers for every response.
-async fn default_response_headers_middleware(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-
-    // Add the `Date` header if it's not already present.
-    if !response.headers().contains_key("Date") {
-        response
-            .headers_mut()
-            .insert("Date", Utc::now().to_string().parse().unwrap());
-    }
-
-    // Add the `x-ms-request-id` header if it's not already present.
-    if !response.headers().contains_key("x-ms-request-id") {
-        response.headers_mut().insert(
-            "x-ms-request-id",
-            Uuid::new_v4().to_string().parse().unwrap(),
-        );
-    }
-
-    response
-}
 
 /// Middleware that authenticates the request.
 /// TODO: we should eventually extract this into an `Authenticator` trait, the request should only
@@ -227,17 +207,6 @@ fn get_header_string_allow_empty(headers: &HeaderMap, key: &str) -> String {
     String::new()
 }
 
-fn log_request(req: &Request<axum::body::Body>, _span: &tracing::Span) {
-    let method = req.method();
-    let uri = req.uri();
-
-    tracing::trace!(method = %method, uri = %uri, "Incoming request");
-
-    for (key, value) in req.headers().iter() {
-        tracing::trace!(header = %key, value = ?value, "Request header");
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -254,9 +223,14 @@ async fn main() {
         .route("/{account_name}", get(account))
         .layer(
             ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http().on_request(log_request))
-                .layer(middleware::from_fn(default_response_headers_middleware))
-                .layer(middleware::from_fn(auth_middleware)),
+                .layer(TraceLayer::new_for_http().on_request(middleware::log_request))
+                .layer(axum::middleware::from_fn(
+                    middleware::set_default_response_headers,
+                ))
+                .layer(axum::middleware::from_fn(
+                    middleware::validate_request_headers,
+                ))
+                .layer(axum::middleware::from_fn(auth_middleware)),
         );
 
     let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
