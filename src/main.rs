@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use axum::{
     Router,
     body::Body,
@@ -9,8 +10,10 @@ use axum::{
     response::Response,
     routing::get,
 };
+use azurite_rs::{config::Config, emulator};
 use base64::prelude::*;
 use chrono::{DateTime, Duration, Utc};
+use clap::Parser;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -18,9 +21,6 @@ use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-
-mod authorization;
-mod middleware;
 
 const EMULATOR_STORAGE_ACCOUNT_KIND: &str = "StorageV2";
 const EMULATOR_STORAGE_SKU: &str = "Standard_RAGRS";
@@ -208,33 +208,23 @@ fn get_header_string_allow_empty(headers: &HeaderMap, key: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     tracing_subscriber::fmt()
         .compact()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("azurite_rs=debug,tower_http=debug"))
-                .unwrap(),
+                .context("failed to read the RUST_LOG environment variable")?,
         )
         .init();
 
-    let app = Router::new()
-        .route("/", get(|| async { "Hello, World!" }))
-        .route("/{account_name}", get(account))
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http().on_request(middleware::log_request))
-                .layer(axum::middleware::from_fn(
-                    middleware::set_default_response_headers,
-                ))
-                .layer(axum::middleware::from_fn(
-                    middleware::validate_request_headers,
-                ))
-                .layer(axum::middleware::from_fn(auth_middleware)),
-        );
+    let config = Config::parse();
+    tracing::debug!("Loaded config: {:?}", config);
 
-    let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    emulator::start(config).await?;
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
