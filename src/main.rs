@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use axum::{
     Router,
     body::Body,
     extract::{Path, Query, Request},
     http::{HeaderMap, StatusCode},
-    middleware::{self, Next},
+    middleware::Next,
     response::Response,
     routing::get,
 };
+use azurite_rs::{config::Config, emulator};
+use base64::prelude::*;
 use chrono::{DateTime, Duration, Utc};
+use clap::Parser;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -17,7 +21,6 @@ use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 const EMULATOR_STORAGE_ACCOUNT_KIND: &str = "StorageV2";
 const EMULATOR_STORAGE_SKU: &str = "Standard_RAGRS";
@@ -25,28 +28,6 @@ const EMULATOR_STORAGE_VERSION: &str = "2025-05-05";
 const EMULATOR_HNS_ENABLED: bool = false;
 const EMULATOR_DEFAULT_ACCOUNT_KEY: &str =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
-
-/// Middleware that adds default response headers for every response.
-async fn default_response_headers_middleware(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-
-    // Add the `Date` header if it's not already present.
-    if !response.headers().contains_key("Date") {
-        response
-            .headers_mut()
-            .insert("Date", Utc::now().to_string().parse().unwrap());
-    }
-
-    // Add the `x-ms-request-id` header if it's not already present.
-    if !response.headers().contains_key("x-ms-request-id") {
-        response.headers_mut().insert(
-            "x-ms-request-id",
-            Uuid::new_v4().to_string().parse().unwrap(),
-        );
-    }
-
-    response
-}
 
 /// Middleware that authenticates the request.
 /// TODO: we should eventually extract this into an `Authenticator` trait, the request should only
@@ -66,10 +47,16 @@ async fn auth_middleware(
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    let utc_date: DateTime<Utc> = date_header.parse().map_err(|_| StatusCode::FORBIDDEN)?;
+    let utc_date: DateTime<Utc> = DateTime::parse_from_rfc2822(date_header)
+        .map_err(|parse_error| {
+            tracing::error!("Error parsing date header value: {}", parse_error);
+            StatusCode::FORBIDDEN
+        })?
+        .to_utc();
 
     // Ensure the date header is no older than 15 minutes to prevent replay attacks.
     if Utc::now().signed_duration_since(utc_date) > Duration::minutes(15) {
+        tracing::debug!("Date header is older than 15 mins");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -80,19 +67,20 @@ async fn auth_middleware(
         .to_str()
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
-    // Parse the auth header to extract the authentication scheme, account name, and signature
+    // Parse the auth header to extract the authentication scheme, account name, and signature.
     // Format: "[SharedKey|SharedKeyLite] <AccountName>:<Signature>"
     let (auth_scheme, account_and_signature) = match auth_header.split_once(' ') {
         Some(parts) => parts,
         None => return Err(StatusCode::FORBIDDEN),
     };
 
-    // Ensure the auth scheme is either "SharedKey" or "SharedKeyLite"
+    // Ensure the auth scheme is either "SharedKey" or "SharedKeyLite".
     if auth_scheme != "SharedKey" && auth_scheme != "SharedKeyLite" {
+        tracing::debug!("Invalid auth scheme: {}", auth_scheme);
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Extract the account name and signature
+    // Extract the account name and signature.
     let (account_name, signature) = match account_and_signature.split_once(':') {
         Some(parts) => parts,
         None => return Err(StatusCode::FORBIDDEN),
@@ -100,6 +88,7 @@ async fn auth_middleware(
 
     // TODO: check if account exists - 404?
     if account_name.is_empty() {
+        tracing::debug!("Account name is empty");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -127,9 +116,7 @@ async fn auth_middleware(
         canonicalized_resource
     );
 
-    tracing::debug!("Generated signature: {}", generated_signature);
-
-    if !verify_signature(&generated_signature, signature, account_name) {
+    if !verify_signature(&generated_signature, signature) {
         tracing::debug!("Signature verification failed");
         return Err(StatusCode::FORBIDDEN);
     } else {
@@ -163,13 +150,13 @@ fn canonicalize_ms_headers(headers: &HeaderMap) -> String {
 
 /// Canonicalizes the resource string.
 fn canonicalize_resource(uri: &str, account_name: &str) -> String {
-    // Parse the URI to extract path and query
+    // Parse the URI to extract path and query.
     let uri_parts: Vec<&str> = uri.split('?').collect();
     let path = uri_parts[0];
 
     let mut result = format!("/{}/{}", account_name, path.trim_start_matches('/'));
 
-    // If there are query parameters, canonicalize them
+    // If there are query parameters, canonicalize them.
     if uri_parts.len() > 1 {
         let query = uri_parts[1];
         let mut params = BTreeMap::new();
@@ -195,21 +182,17 @@ fn canonicalize_resource(uri: &str, account_name: &str) -> String {
 }
 
 // Function to validate the signature
-fn verify_signature(string_to_sign: &str, provided_signature: &str, account_name: &str) -> bool {
+fn verify_signature(string_to_sign: &str, provided_signature: &str) -> bool {
     // For the emulator, we use the default key
-    let decoded_key = base64::decode(EMULATOR_DEFAULT_ACCOUNT_KEY).unwrap_or_default();
+    let decoded_key = BASE64_STANDARD
+        .decode(EMULATOR_DEFAULT_ACCOUNT_KEY)
+        .expect("account key should be base64 decodable");
 
-    // Create HMAC-SHA256 instance
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(&decoded_key).expect("HMAC can take key of any size");
-
-    // Update with string to sign
-    mac.update(string_to_sign.as_bytes());
+    let mut hmac = Hmac::<Sha256>::new_from_slice(&decoded_key).unwrap();
+    hmac.update(string_to_sign.as_bytes());
 
     // Get the result and compare
-    let computed_signature = base64::encode(mac.finalize().into_bytes());
-
-    // Compare signatures (timing-attack safe comparison would be better)
+    let computed_signature = BASE64_STANDARD.encode(hmac.finalize().into_bytes());
     provided_signature == computed_signature
 }
 
@@ -224,40 +207,24 @@ fn get_header_string_allow_empty(headers: &HeaderMap, key: &str) -> String {
     String::new()
 }
 
-fn log_request(req: &Request<axum::body::Body>, _span: &tracing::Span) {
-    let method = req.method();
-    let uri = req.uri();
-
-    tracing::trace!(method = %method, uri = %uri, "Incoming request");
-
-    for (key, value) in req.headers().iter() {
-        tracing::trace!(header = %key, value = ?value, "Request header");
-    }
-}
-
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     tracing_subscriber::fmt()
         .compact()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("azurite_rs=debug,tower_http=debug"))
-                .unwrap(),
+                .context("failed to read the RUST_LOG environment variable")?,
         )
         .init();
 
-    let app = Router::new()
-        .route("/", get(|| async { "Hello, World!" }))
-        .route("/{account_name}", get(account))
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http().on_request(log_request))
-                .layer(middleware::from_fn(default_response_headers_middleware))
-                .layer(middleware::from_fn(auth_middleware)),
-        );
+    let config = Config::parse();
+    tracing::debug!("Loaded config: {:?}", config);
 
-    let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    emulator::start(config).await?;
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
